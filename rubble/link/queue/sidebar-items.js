@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["create","Converts a `BBQueue` to a pair of packet queue endpoints."]],"struct":[["Consume","Bundles a `T` along with information telling a queue whether to consume a packet."],["Consumer","Reading end of a packet queue."],["Producer","Writing end of a packet queue."]]});
