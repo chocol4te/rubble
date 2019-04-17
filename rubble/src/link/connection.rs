@@ -1,20 +1,22 @@
-//! Link-Layer connection management.
+//! Link-Layer connection management and LLCP implementation.
 
 use {
     crate::{
         bytes::*,
         link::{
             advertising::ConnectRequestData,
-            data::{self, Header, Llid, Pdu},
+            data::{self, ControlPdu, Header, Llid, Pdu},
             queue::{Consume, Consumer, Producer},
-            Cmd, HardwareInterface, NextUpdate, RadioCmd, SeqNum, Transmitter,
+            Cmd, CompanyId, FeatureSet, HardwareInterface, NextUpdate, RadioCmd, SeqNum,
+            Transmitter,
         },
         phy::{ChannelMap, DataChannel},
         time::{Duration, Instant, Timer},
-        utils::HexSlice,
+        utils::{Hex, HexSlice},
+        BLUETOOTH_VERSION,
     },
-    core::marker::PhantomData,
-    log::trace,
+    core::{marker::PhantomData, num::Wrapping},
+    log::{info, trace},
 };
 
 /// Connection state.
@@ -28,6 +30,9 @@ pub struct Connection<HW: HardwareInterface> {
 
     /// Connection event interval (duration between the start of 2 subsequent connection events).
     conn_interval: Duration,
+
+    /// Connection event counter (`connEventCount`).
+    conn_event_count: Wrapping<u16>,
 
     /// Unmapped data channel on which the next connection event will take place.
     ///
@@ -84,6 +89,7 @@ impl<HW: HardwareInterface> Connection<HW> {
             channel_map: *lldata.channel_map(),
             hop: lldata.hop(),
             conn_interval: lldata.interval(),
+            conn_event_count: Wrapping(0xFFFF), // wraps to 0 on first event
 
             unmapped_channel: DataChannel::new(0),
             channel: DataChannel::new(0),
@@ -128,7 +134,15 @@ impl<HW: HardwareInterface> Connection<HW> {
         payload: &[u8],
         crc_ok: bool,
     ) -> Result<Cmd, ()> {
+        // If the sequence number of the packet is the same as our next expected sequence number,
+        // the packet contains new data that we should try to process. However, if the CRC is bad,
+        // we'll never try to process the data and instead request a retransmission.
         let is_new = header.sn() == self.next_expected_seq_num && crc_ok;
+
+        // If the packet's "NESN" is equal to our last sent sequence number + 1, the other side has
+        // acknowledged our last packet (and is now expecting one with an incremented seq. num.).
+        // However, if the CRC is bad, the bit might be flipped, so we cannot assume that the packet
+        // was acknowledged and thus always retransmit.
         let acknowledged = header.nesn() == self.transmit_seq_num + SeqNum::ONE && crc_ok;
 
         let is_empty = header.llid() == Llid::DataCont && payload.is_empty();
@@ -137,9 +151,15 @@ impl<HW: HardwareInterface> Connection<HW> {
             if is_empty {
                 // Always acknowledge empty packets, no need to process them
                 self.next_expected_seq_num += SeqNum::ONE;
+            } else if header.llid() == Llid::Control {
+                // LLCP message, process it immediately, falling back to using the channel if this
+                // is impossible
+                if let Ok(pdu) = ControlPdu::from_bytes(&mut ByteReader::new(payload)) {
+                    self.process_control_pdu(pdu);
+                }
             } else {
-                // Try to buffer the packet. If it fails, we don't acknowledge it, so it will be resent
-                // until we have space.
+                // Try to buffer the packet. If it fails, we don't acknowledge it, so it will be
+                // resent until we have space.
 
                 if self.rx.produce_raw(header, payload).is_ok() {
                     // Acknowledge the packet
@@ -199,10 +219,15 @@ impl<HW: HardwareInterface> Connection<HW> {
         let last_channel = self.channel;
 
         // FIXME: Don't hop if one of the MD bits is set to true
-        self.hop_channel();
+        {
+            // Connection event closes
+            self.hop_channel();
+            self.conn_event_count += Wrapping(1);
+        }
 
         trace!(
-            "DATA({}->{})<- {}{:?}, {:?}",
+            "#{} DATA({}->{})<- {}{:?}, {:?}",
+            self.conn_event_count,
             last_channel.index(),
             self.channel.index(),
             if crc_ok { "" } else { "BADCRC, " },
@@ -220,16 +245,19 @@ impl<HW: HardwareInterface> Connection<HW> {
         })
     }
 
+    /// Must be called when the configured timer expires (according to a `Cmd` returned earlier).
     pub fn timer_update(&mut self, timer: &mut HW::Timer) -> Result<Cmd, ()> {
         if self.received_packet {
             // No packet from master, skip this connection event and listen on the next channel
 
             let last_channel = self.channel;
             self.hop_channel();
+            self.conn_event_count += Wrapping(1);
             trace!(
-                "DATA({}->{}): missed conn event",
+                "DATA({}->{}): missed conn event #{}",
                 last_channel.index(),
-                self.channel.index()
+                self.channel.index(),
+                self.conn_event_count.0,
             );
 
             Ok(Cmd {
@@ -245,6 +273,7 @@ impl<HW: HardwareInterface> Connection<HW> {
 
             // TODO: Move the transmit window forward by the `connInterval`.
 
+            self.conn_event_count += Wrapping(1);
             trace!("missed transmit window");
             Err(())
         }
@@ -291,5 +320,34 @@ impl<HW: HardwareInterface> Connection<HW> {
 
         let pl = &tx.tx_payload_buf()[..usize::from(header.payload_length())];
         trace!("DATA->{:?}, {:?}", header, HexSlice(pl));
+    }
+
+    /// Tries to process and acknowledge an LL Control PDU.
+    fn process_control_pdu(&mut self, pdu: ControlPdu) {
+        // Acknowledge PDU
+        self.next_expected_seq_num += SeqNum::ONE;
+
+        info!("<- LL Control PDU: {:?}", pdu);
+        let response = match pdu {
+            ControlPdu::FeatureReq { features_master } => ControlPdu::FeatureRsp {
+                features_used: features_master & FeatureSet::supported(),
+            },
+            ControlPdu::VersionInd { .. } => {
+                // FIXME this should be something real, and defined somewhere else
+                let comp_id = 0xFFFF;
+                // FIXME this should correlate with the Cargo package version
+                let sub_vers_nr = 0x0000;
+
+                ControlPdu::VersionInd {
+                    vers_nr: BLUETOOTH_VERSION,
+                    comp_id: CompanyId::from_raw(comp_id),
+                    sub_vers_nr: Hex(sub_vers_nr),
+                }
+            }
+            _ => ControlPdu::UnknownRsp {
+                unknown_type: pdu.opcode(),
+            },
+        };
+        info!("-> Response: {:?}", response);
     }
 }
