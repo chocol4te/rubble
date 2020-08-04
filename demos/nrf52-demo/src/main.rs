@@ -20,14 +20,27 @@ macro_rules! config {
                 let rxd = $p0.$rx_pin.into_floating_input().degrade();
                 let txd = $p0.$tx_pin.into_push_pull_output(Level::Low).degrade();
 
-                let pins = hal::uarte::Pins {
-                    rxd,
-                    txd,
-                    cts: None,
-                    rts: None,
-                };
+                #[cfg(feature = "51")]
+                {
+                    let pins = hal::uart::Pins {
+                        rxd,
+                        txd,
+                        cts: None,
+                        rts: None,
+                    };
+                    hal::uart::Uart::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
+                }
 
-                hal::uarte::Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
+                #[cfg(not(feature = "51"))]
+                {
+                    let pins = hal::uarte::Pins {
+                        rxd,
+                        txd,
+                        cts: None,
+                        rts: None,
+                    };
+                    hal::uarte::Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
+                }
             }};
         }
     };
@@ -38,6 +51,8 @@ mod config;
 mod logger;
 
 // Import the right HAL/PAC crate, depending on the target chip
+#[cfg(feature = "51")]
+use nrf51_hal as hal;
 #[cfg(feature = "52810")]
 use nrf52810_hal as hal;
 #[cfg(feature = "52832")]
@@ -45,11 +60,24 @@ use nrf52832_hal as hal;
 #[cfg(feature = "52840")]
 use nrf52840_hal as hal;
 
+#[cfg(feature = "51")]
+use hal::{
+    gpio::Level,
+    pac::UART0 as UARTE0,
+    prelude::*,
+    uart::{Baudrate, Parity, Uart as Uarte},
+};
+
+#[cfg(not(feature = "51"))]
+use hal::{
+    gpio::Level,
+    pac::UARTE0,
+    uarte::{Baudrate, Parity, Uarte},
+};
+
 use bbqueue::Consumer;
 use core::fmt::Write;
 use core::sync::atomic::{compiler_fence, Ordering};
-use hal::uarte::{Baudrate, Parity, Uarte};
-use hal::{gpio::Level, pac::UARTE0};
 use rubble::l2cap::{BleChannelMap, L2CAPState};
 use rubble::link::queue::{PacketQueue, SimpleQueue};
 use rubble::link::{ad_structure::AdStructure, LinkLayer, Responder, MIN_PDU_BUF};
@@ -94,9 +122,16 @@ const APP: () = {
 
         let ble_timer = BleTimer::init(ctx.device.TIMER0);
 
+        #[cfg(feature = "51")]
+        let p0 = hal::gpio::p0::Parts::new(ctx.device.GPIO);
+        #[cfg(not(feature = "51"))]
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
 
+        #[cfg(feature = "51")]
+        let uart = ctx.device.UART0;
+        #[cfg(not(feature = "51"))]
         let uart = ctx.device.UARTE0;
+
         let mut serial = apply_config!(p0, uart);
         writeln!(serial, "\n--- INIT ---").unwrap();
 
@@ -195,8 +230,18 @@ const APP: () = {
         loop {
             if cfg!(feature = "log") {
                 while let Ok(grant) = ctx.resources.log_sink.read() {
-                    for chunk in grant.buf().chunks(255) {
-                        ctx.resources.serial.write(chunk).unwrap();
+                    #[cfg(feature = "51")]
+                    {
+                        for byte in grant.buf() {
+                            ctx.resources.serial.write(*byte).unwrap();
+                        }
+                    }
+
+                    #[cfg(not(feature = "51"))]
+                    {
+                        for chunk in grant.buf().chunks(255) {
+                            ctx.resources.serial.write(chunk).unwrap();
+                        }
                     }
 
                     let len = grant.buf().len();
